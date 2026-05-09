@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 #if CONTRACTS_FULL_SHIM
 using Contract = System.Diagnostics.ContractsShim.Contract;
 #else
@@ -371,16 +373,19 @@ namespace KSoft.Phoenix.Resource
 			Contract.Requires(blockStream.IsReading);
 
 			var eraExpander = KSoft.Debug.TypeCheck.CastReference<EraFileExpander>(blockStream.Owner);
+			var workItems = BuildUnpackWorkItems(workPath, eraExpander);
 
 			eraExpander.ProgressOutput?.WriteLine("\tUnpacking files...");
 
-			for (int x = FileChunksFirstIndex; x < mFiles.Count; x++)
+			CreatePathsForUnpacking(workItems);
+
+			if (eraExpander.TryGetLoadedEraBytes(out byte[] eraBytes) && workItems.Count > 1)
 			{
-				var file = mFiles[x];
-
-				eraExpander.ProgressOutput?.Write("\r\t\t{0} ", file.EntryId.ToString("X16"));
-
-				TryUnpack(blockStream, workPath, eraExpander, file);
+				UnpackToDiskParallel(eraBytes, blockStream.ByteOrder, workItems, eraExpander);
+			}
+			else
+			{
+				UnpackToDiskSequential(blockStream, workItems, eraExpander);
 			}
 
 			if (eraExpander.ProgressOutput != null)
@@ -390,45 +395,116 @@ namespace KSoft.Phoenix.Resource
 			}
 
 			WriteLocalScenarioFiles(workPath, eraExpander);
-
-			mDirsThatExistForUnpacking = null;
 		}
 
-		private bool TryUnpack(IO.EndianStream blockStream, string workPath, EraFileExpander expander, EraFileEntryChunk file)
+		private sealed class UnpackWorkItem
 		{
-			if (IsIgnoredLocalFile(file.FileName))
+			public EraFileEntryChunk File;
+			public string FullPath;
+		}
+
+		private List<UnpackWorkItem> BuildUnpackWorkItems(string workPath, EraFileExpander expander)
+		{
+			var workItems = new List<UnpackWorkItem>(FileChunksCount);
+
+			for (int x = FileChunksFirstIndex; x < mFiles.Count; x++)
 			{
-				return false;
+				var file = mFiles[x];
+
+				if (IsIgnoredLocalFile(file.FileName))
+				{
+					continue;
+				}
+
+				string fullPath = System.IO.Path.Combine(workPath, file.FileName);
+
+				if (ResourceUtils.IsLocalScenarioFile(file.FileName))
+				{
+					continue;
+				}
+				else if (!ShouldUnpack(expander, fullPath))
+				{
+					continue;
+				}
+
+				workItems.Add(new UnpackWorkItem
+				{
+					File = file,
+					FullPath = fullPath,
+				});
 			}
 
-			string full_path = System.IO.Path.Combine(workPath, file.FileName);
+			return workItems;
+		}
 
-			if (ResourceUtils.IsLocalScenarioFile(file.FileName))
+		private static void CreatePathsForUnpacking(List<UnpackWorkItem> workItems)
+		{
+			var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+			foreach (var workItem in workItems)
 			{
-				return false;
+				string folder = System.IO.Path.GetDirectoryName(workItem.FullPath);
+
+				if (createdDirs.Add(folder) && !System.IO.Directory.Exists(folder))
+				{
+					System.IO.Directory.CreateDirectory(folder);
+				}
 			}
-			else if (!ShouldUnpack(expander, full_path))
+		}
+
+		private void UnpackToDiskSequential(IO.EndianStream blockStream, List<UnpackWorkItem> workItems, EraFileExpander expander)
+		{
+			foreach (var workItem in workItems)
 			{
-				return false;
+				expander.ProgressOutput?.Write("\r\t\t{0} ", workItem.File.EntryId.ToString("X16"));
+
+				UnpackToDisk(blockStream, workItem.FullPath, expander, workItem.File);
 			}
+		}
 
-			CreatePathForUnpacking(full_path);
+		private void UnpackToDiskParallel(byte[] eraBytes, Shell.EndianFormat byteOrder, List<UnpackWorkItem> workItems, EraFileExpander expander)
+		{
+			var progressOutput = expander.ProgressOutput;
+			int completedFiles = 0;
+			int totalFiles = workItems.Count;
+			object progressLock = new();
 
-			UnpackToDisk(blockStream, full_path, expander, file);
-			return true;
+			int workerCount = Environment.ProcessorCount;
+			progressOutput?.WriteLine("\t\tUsing {0} worker threads...", workerCount);
+
+			var parallelOptions = new ParallelOptions
+			{
+				MaxDegreeOfParallelism = workerCount,
+			};
+
+			Parallel.ForEach(workItems, parallelOptions, workItem =>
+			{
+				using (var ms = new System.IO.MemoryStream(eraBytes, writable: false))
+				using (var s = new IO.EndianStream(ms, byteOrder, permissions: System.IO.FileAccess.Read))
+				{
+					s.StreamMode = System.IO.FileAccess.Read;
+
+					UnpackToDisk(s, workItem.FullPath, expander, workItem.File);
+				}
+
+				if (progressOutput != null)
+				{
+					int done = Interlocked.Increment(ref completedFiles);
+					if (done == totalFiles || (done & 0x3F) == 0)
+					{
+						lock (progressLock)
+						{
+							progressOutput.Write("\r\t\t{0}/{1} files ", done, totalFiles);
+						}
+					}
+				}
+			});
 		}
 
 		private void UnpackToDisk(IO.EndianStream blockStream, string fullPath, EraFileExpander expander, EraFileEntryChunk file)
 		{
 			byte[] buffer = file.GetBuffer(blockStream);
-
-			using (var fs = System.IO.File.Create(fullPath))
-			{
-				fs.Write(buffer, 0, buffer.Length);
-			}
-
-			System.IO.File.SetCreationTimeUtc(fullPath, file.FileDateTime);
-			System.IO.File.SetLastWriteTimeUtc(fullPath, file.FileDateTime);
+			bool isScaleformFile = ResourceUtils.IsScaleformFile(fullPath);
 
 			if (ResourceUtils.IsXmbFile(fullPath))
 			{
@@ -441,11 +517,20 @@ namespace KSoft.Phoenix.Resource
 						va_size = Shell.ProcessorSize.x64;
 					}
 
-					TransformXmbToXml(buffer, fullPath, blockStream.ByteOrder, va_size);
-					DeleteTranslatedXmbFile(fullPath, expander);
+					string xmlPath = TransformXmbToXml(buffer, fullPath, blockStream.ByteOrder, va_size);
+					SetFileTimestamps(xmlPath, file.FileDateTime);
+					return;
 				}
 			}
-			else if (ResourceUtils.IsScaleformFile(fullPath))
+
+			using (var fs = System.IO.File.Create(fullPath))
+			{
+				fs.Write(buffer, 0, buffer.Length);
+			}
+
+			SetFileTimestamps(fullPath, file.FileDateTime);
+
+			if (isScaleformFile)
 			{
 				if (expander.ExpanderOptions.Test(EraFileExpanderOptions.DecompressUIFiles))
 				{
@@ -501,27 +586,13 @@ namespace KSoft.Phoenix.Resource
 			}
 		}
 
-		private static void DeleteTranslatedXmbFile(string fullPath, EraFileExpander expander)
+		private static void SetFileTimestamps(string fullPath, DateTime fileDateTime)
 		{
-			try
-			{
-				System.IO.File.Delete(fullPath);
-			}
-			catch (Exception ex)
-			{
-				Debug.Trace.Resource.TraceEvent(System.Diagnostics.TraceEventType.Warning, TypeExtensions.kNone,
-					"Failed to delete translated XMB file '{0}': {1}",
-					fullPath, ex);
-
-				if (expander.VerboseOutput != null)
-				{
-					expander.VerboseOutput.WriteLine("Failed to delete translated XMB file '{0}': {1}",
-						fullPath, ex.Message);
-				}
-			}
+			System.IO.File.SetCreationTimeUtc(fullPath, fileDateTime);
+			System.IO.File.SetLastWriteTimeUtc(fullPath, fileDateTime);
 		}
 
-		private void TransformXmbToXml(byte[] eraFileEntryBuffer, string fullPath, Shell.EndianFormat byteOrder, Shell.ProcessorSize vaSize)
+		private string TransformXmbToXml(byte[] eraFileEntryBuffer, string fullPath, Shell.EndianFormat byteOrder, Shell.ProcessorSize vaSize)
 		{
 			byte[] xmb_buffer;
 
@@ -554,6 +625,8 @@ namespace KSoft.Phoenix.Resource
 					xmbf.ToXml(xmb_path);
 				}
 			}
+
+			return xmb_path;
 		}
 
 		private bool DecompressUIFileToDisk(byte[] eraFileEntryBuffer, string fullPath)
@@ -618,25 +691,6 @@ namespace KSoft.Phoenix.Resource
 			{
 				out_s.Write(swf_signature);
 				out_s.Write(eraFileEntryBuffer, sizeof(uint), eraFileEntryBuffer.Length - sizeof(uint));
-			}
-		}
-
-		private HashSet<string> mDirsThatExistForUnpacking;
-		private void CreatePathForUnpacking(string full_path)
-		{
-			if (mDirsThatExistForUnpacking == null)
-			{
-				mDirsThatExistForUnpacking = new();
-			}
-
-			string folder = System.IO.Path.GetDirectoryName(full_path);
-			// don't bother checking the file system if we've already encountered this folder
-			if (mDirsThatExistForUnpacking.Add(folder))
-			{
-				if (!System.IO.Directory.Exists(folder))
-				{
-					System.IO.Directory.CreateDirectory(folder);
-				}
 			}
 		}
 
@@ -1057,7 +1111,11 @@ namespace KSoft.Phoenix.Resource
 				return false;
 			}
 
-			CreatePathForUnpacking(fullPath);
+			string folder = System.IO.Path.GetDirectoryName(fullPath);
+			if (!System.IO.Directory.Exists(folder))
+			{
+				System.IO.Directory.CreateDirectory(folder);
+			}
 			return true;
 		}
 

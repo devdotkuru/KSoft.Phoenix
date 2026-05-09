@@ -31,6 +31,7 @@ namespace KSoft.Phoenix.Resource
 
 		System.IO.Stream mEraBaseStream;
 		IO.EndianStream mEraStream;
+		byte[] mEraBytes;
 
 		/// <see cref="EraFileExpanderOptions"/>
 		public Collections.BitVector32 ExpanderOptions;
@@ -44,8 +45,14 @@ namespace KSoft.Phoenix.Resource
 		{
 			base.Dispose();
 
+			ReleaseLoadedEraData();
+		}
+
+		internal void ReleaseLoadedEraData()
+		{
 			Util.DisposeAndNull(ref mEraStream);
 			Util.DisposeAndNull(ref mEraBaseStream);
+			mEraBytes = null;
 		}
 
 		bool ReadEraFromStream()
@@ -91,6 +98,7 @@ namespace KSoft.Phoenix.Resource
 					DecryptFileBytes(era_bytes);
 				}
 
+				mEraBytes = era_bytes;
 				mEraBaseStream = new System.IO.MemoryStream(era_bytes, writable: false);
 			}
 
@@ -102,18 +110,23 @@ namespace KSoft.Phoenix.Resource
 			return ReadEraFromStream();
 		}
 
+		internal bool TryGetLoadedEraBytes(out byte[] eraBytes)
+		{
+			eraBytes = mEraBytes;
+
+			return eraBytes != null;
+		}
+
 		void DecryptFileBytes(byte[] eraBytes)
 		{
 			using (var era_in_ms = new System.IO.MemoryStream(eraBytes, writable: false))
-			using (var era_out_ms = new System.IO.MemoryStream(eraBytes, writable: true))
 			using (var era_reader = new IO.EndianReader(era_in_ms, Shell.EndianFormat.Big))
-			using (var era_writer = new IO.EndianWriter(era_out_ms, Shell.EndianFormat.Big))
 			{
 				// "Halo Wars Alpha 093106 Feb 21 2009" was released pre-decrypted, so try and detect if the file is already decrypted first
 				if (!EraFileHeader.VerifyIsEraAndDecrypted(era_reader))
 				{
-					CryptStream(era_reader, era_writer,
-						Security.Cryptography.CryptographyTransformType.Decrypt);
+					Security.Cryptography.PhxTEA.DecryptBufferInPlace(eraBytes,
+						Security.Cryptography.PhxTEA.kKeyEra);
 				}
 			}
 		}
@@ -162,30 +175,35 @@ namespace KSoft.Phoenix.Resource
 
 			bool result = true;
 
-			ProgressOutput?.WriteLine("Outputting listing...");
-
-			try { SaveListing(workPath, listingName); }
-			catch (Exception ex)
+			try
 			{
-				VerboseOutput?.WriteLine("\tEncountered an error while outputting listing: {0}", ex);
-				result = false;
-			}
+				ProgressOutput?.WriteLine("Outputting listing...");
 
-			if (result && !ExpanderOptions.Test(EraFileExpanderOptions.OnlyDumpListing))
-			{
-				ProgressOutput?.WriteLine("Expanding archive to {0}...", workPath);
-
-				try { mEraFile.ExpandTo(mEraStream, workPath); }
+				try { SaveListing(workPath, listingName); }
 				catch (Exception ex)
 				{
-					VerboseOutput?.WriteLine("\tEncountered an error while expanding archive: {0}", ex);
+					VerboseOutput?.WriteLine("\tEncountered an error while outputting listing: {0}", ex);
 					result = false;
 				}
 
-				ProgressOutput?.WriteLine("Done");
-			}
+				if (result && !ExpanderOptions.Test(EraFileExpanderOptions.OnlyDumpListing))
+				{
+					ProgressOutput?.WriteLine("Expanding archive to {0}...", workPath);
 
-			mEraStream.Close();
+					try { mEraFile.ExpandTo(mEraStream, workPath); }
+					catch (Exception ex)
+					{
+						VerboseOutput?.WriteLine("\tEncountered an error while expanding archive: {0}", ex);
+						result = false;
+					}
+
+					ProgressOutput?.WriteLine("Done");
+				}
+			}
+			finally
+			{
+				ReleaseLoadedEraData();
+			}
 
 			return result;
 		}

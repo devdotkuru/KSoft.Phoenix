@@ -186,11 +186,16 @@ namespace PhxGui
 					}
 					else
 					{
-						Dispatcher.BeginInvoke(DispatcherPriority.Background,
-							new Action(() =>
-							{
-								ViewModel.FinishProcessing();
-							}));
+						Task.Run(() =>
+						{
+							CompactLargeOperationMemory();
+
+							Dispatcher.BeginInvoke(DispatcherPriority.Background,
+								new Action(() =>
+								{
+									ViewModel.FinishProcessing();
+								}));
+						});
 					}
 				});
 			}

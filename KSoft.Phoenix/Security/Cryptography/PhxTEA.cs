@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 #if CONTRACTS_FULL_SHIM
@@ -175,8 +177,11 @@ namespace KSoft.Security.Cryptography
 
 		// used to use a hard coded 0xBCCD0923, which is (uint)(kDefaultIV >> 10)
 		uint GetIterationMod(uint iteration)
+			=> GetIterationMod(iteration, InitializationVector);
+
+		static uint GetIterationMod(uint iteration, ulong initializationVector)
 		{
-			uint iter_mod = iteration + (uint)(InitializationVector >> 10);
+			uint iter_mod = iteration + (uint)(initializationVector >> 10);
 			if (iter_mod == 0)
 			{
 				iter_mod++;
@@ -342,6 +347,99 @@ namespace KSoft.Security.Cryptography
 			buffOut[index+0] = q0; buffOut[index+1] = q1; buffOut[index+2] = q2; buffOut[index+3] = q3;
 			buffOut[index+4] = q4; buffOut[index+5] = q5; buffOut[index+6] = q6; buffOut[index+7] = q7;
 		}
+
+		static void DecryptIterationBlock64(ulong[] key, ReadOnlySpan<byte> input, Span<byte> output,
+			uint iteration, ulong initializationVector)
+		{
+			ulong	block0 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(0 * sizeof(ulong), sizeof(ulong))),
+					block1 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(1 * sizeof(ulong), sizeof(ulong))),
+					block2 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(2 * sizeof(ulong), sizeof(ulong))),
+					block3 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(3 * sizeof(ulong), sizeof(ulong))),
+					block4 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(4 * sizeof(ulong), sizeof(ulong))),
+					block5 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(5 * sizeof(ulong), sizeof(ulong))),
+					block6 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(6 * sizeof(ulong), sizeof(ulong))),
+					block7 = BinaryPrimitives.ReadUInt64BigEndian(input.Slice(7 * sizeof(ulong), sizeof(ulong)));
+
+			ulong t1, t2, t3, t4;
+			DecryptFourBlocks(	block0, block1, block2, block3,
+							out t1, out t2, out t3, out t4,		key[0], key[1] );
+
+			ulong t5, t6, t7, t8;
+			DecryptFourBlocks(	block6 ^ block7,	block4 ^ block5 ^ block7,
+							block4 ^ block6,	block7 ^ block5,
+							out t5, out t6, out t7, out t8,		key[1], key[2]);
+
+			ulong t9, t10, t11, t12;
+			DecryptFourBlocks(	t4 ^ block7,
+							(t1 - (block6 ^ block7)) ^ t2 ^ block6 ^ block5,
+							t2 ^ block6 ^ block5 ^ (t3 + (block5 ^ block4)),
+							t4 ^ block7 ^ (t3 + (block5 ^ block4)),
+							out t9, out t10, out t11, out t12,	key[1], key[0]);
+
+			ulong q = GetIterationMod(iteration, initializationVector);
+			ulong q0, q1, q2, q3, q4, q5, q6, q7;
+
+			Mod0(ref q, out q0);	Mod1(ref q, out q1);
+			Mod0(ref q, out q2);	Mod1(ref q, out q3);
+			Mod0(ref q, out q4);	Mod1(ref q, out q5);
+			Mod0(ref q, out q6);	Mod1(ref q, out q7);
+
+			q0 ^= t9;
+			q1 ^= t10;
+			q2 ^= t11;
+			q3 ^= t12;
+			q4 ^= t5 ^ t4 ^ block7;
+			q5 ^= t3 + (block5 ^ block4) + t6;
+			q6 ^= t7 ^ t2 ^ block6 ^ block5;
+			q7 ^= t8 - (t1 - (block6 ^ block7));
+
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(0 * sizeof(ulong), sizeof(ulong)), q0);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(1 * sizeof(ulong), sizeof(ulong)), q1);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(2 * sizeof(ulong), sizeof(ulong)), q2);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(3 * sizeof(ulong), sizeof(ulong)), q3);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(4 * sizeof(ulong), sizeof(ulong)), q4);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(5 * sizeof(ulong), sizeof(ulong)), q5);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(6 * sizeof(ulong), sizeof(ulong)), q6);
+			BinaryPrimitives.WriteUInt64BigEndian(output.Slice(7 * sizeof(ulong), sizeof(ulong)), q7);
+		}
+
+		public static void DecryptBufferInPlace(byte[] buffer, ulong[] key, ulong initializationVector = kDefaultIV)
+		{
+			ArgumentNullException.ThrowIfNull(buffer);
+			ArgumentNullException.ThrowIfNull(key);
+			Contract.Assert(key.Length == kKeySize);
+
+			uint iterationCount = GetIterationsCount(buffer.LongLength);
+			if (iterationCount == 0)
+			{
+				return;
+			}
+
+			const int blockSize = sizeof(ulong) * kBlocksPerIteration;
+			if (iterationCount < 4096)
+			{
+				for (uint x = 0; x < iterationCount; x++)
+				{
+					int offset = checked((int)(x * blockSize));
+					DecryptIterationBlock64(key, buffer.AsSpan(offset, blockSize), buffer.AsSpan(offset, blockSize),
+						x, initializationVector);
+				}
+
+				return;
+			}
+
+			var partitions = Partitioner.Create(0, (int)iterationCount, 4096);
+			Parallel.ForEach(partitions, range =>
+			{
+				for (int x = range.Item1; x < range.Item2; x++)
+				{
+					int offset = checked(x * blockSize);
+					DecryptIterationBlock64(key, buffer.AsSpan(offset, blockSize), buffer.AsSpan(offset, blockSize),
+						(uint)x, initializationVector);
+				}
+			});
+		}
+
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE0018:Inline variable declaration")]
 		void EncryptIterationBlock64(ulong[] key, ulong[] buffIn, ulong[] buffOut, uint iteration)
 		{

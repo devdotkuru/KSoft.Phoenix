@@ -1,6 +1,8 @@
 ﻿using System;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Runtime;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Input;
 using KSoft;
@@ -648,5 +650,25 @@ namespace PhxGui
 			ClearProcessFilesHelpText();
 			IsProcessing = false;
 		}
+
+		private static void CompactLargeOperationMemory()
+		{
+			GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+			GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+			GC.WaitForPendingFinalizers();
+			GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+			TrimProcessWorkingSet();
+		}
+
+		private static void TrimProcessWorkingSet()
+		{
+			SetProcessWorkingSetSize(GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1));
+		}
+
+		[DllImport("kernel32.dll")]
+		private static extern IntPtr GetCurrentProcess();
+
+		[DllImport("kernel32.dll")]
+		private static extern bool SetProcessWorkingSetSize(IntPtr processHandle, IntPtr minimumWorkingSetSize, IntPtr maximumWorkingSetSize);
 	};
 }
