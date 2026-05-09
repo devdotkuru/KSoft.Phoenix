@@ -442,6 +442,7 @@ namespace KSoft.Phoenix.Resource
 					}
 
 					TransformXmbToXml(buffer, fullPath, blockStream.ByteOrder, va_size);
+					DeleteTranslatedXmbFile(fullPath, expander);
 				}
 			}
 			else if (ResourceUtils.IsScaleformFile(fullPath))
@@ -496,6 +497,26 @@ namespace KSoft.Phoenix.Resource
 								EraFileExpanderOptions.TranslateGfxFiles, fullPath);
 						}
 					}
+				}
+			}
+		}
+
+		private static void DeleteTranslatedXmbFile(string fullPath, EraFileExpander expander)
+		{
+			try
+			{
+				System.IO.File.Delete(fullPath);
+			}
+			catch (Exception ex)
+			{
+				Debug.Trace.Resource.TraceEvent(System.Diagnostics.TraceEventType.Warning, TypeExtensions.kNone,
+					"Failed to delete translated XMB file '{0}': {1}",
+					fullPath, ex);
+
+				if (expander.VerboseOutput != null)
+				{
+					expander.VerboseOutput.WriteLine("Failed to delete translated XMB file '{0}': {1}",
+						fullPath, ex.Message);
 				}
 			}
 		}

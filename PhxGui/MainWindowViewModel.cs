@@ -118,7 +118,6 @@ namespace PhxGui
 		public MainWindowViewModel()
 		{
 			mFlags.Set(MiscFlags.SeparateEraFolders);
-			mFlags.Set(MiscFlags.DontRemoveXmlOrXmbFiles);
 			mFlags.Set(MiscFlags.UseVerboseOutput);
 
 			ClearStatus();

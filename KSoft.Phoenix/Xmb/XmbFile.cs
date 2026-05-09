@@ -69,7 +69,7 @@ namespace KSoft.Phoenix.Xmb
 					// #HACK to deal with xmb files which weren't updated with new tools
 					if (s.ByteOrder == Shell.EndianFormat.Big)
 					{
-						context.PointerSize = Shell.ProcessorSize.x32;
+						context.PointerSize = DetectBigEndianPointerSize(s);
 					}
 				}
 
@@ -130,6 +130,154 @@ namespace KSoft.Phoenix.Xmb
 					e.ReadChildren(this, context, s);
 				}
 			}
+		}
+
+		private static Shell.ProcessorSize DetectBigEndianPointerSize(IO.EndianReader s)
+		{
+			if (!s.BaseStream.CanSeek)
+			{
+				return Shell.ProcessorSize.x64;
+			}
+
+			long headerStart = s.BaseStream.Position;
+			long streamLength = s.BaseStream.Length;
+
+			var x32 = ReadHeaderInfo(s, headerStart, streamLength, Shell.ProcessorSize.x32);
+			var x64 = ReadHeaderInfo(s, headerStart, streamLength, Shell.ProcessorSize.x64);
+
+			s.Seek(headerStart);
+
+			bool x32Plausible = IsHeaderPlausible(x32, streamLength, Shell.ProcessorSize.x32);
+			bool x64Plausible = IsHeaderPlausible(x64, streamLength, Shell.ProcessorSize.x64);
+
+			if (x64Plausible && (!x32Plausible || (x32.ElementCount == 0 && x64.ElementCount > 0)))
+			{
+				return Shell.ProcessorSize.x64;
+			}
+
+			if (x32Plausible)
+			{
+				return Shell.ProcessorSize.x32;
+			}
+
+			return Shell.ProcessorSize.x64;
+		}
+
+		private readonly struct HeaderInfo
+		{
+			public HeaderInfo(int elementCount, ulong elementsOffset, int poolSize, ulong poolOffset)
+			{
+				ElementCount = elementCount;
+				ElementsOffset = elementsOffset;
+				PoolSize = poolSize;
+				PoolOffset = poolOffset;
+			}
+
+			public readonly int ElementCount;
+			public readonly ulong ElementsOffset;
+			public readonly int PoolSize;
+			public readonly ulong PoolOffset;
+
+			public static HeaderInfo Invalid => new(TypeExtensions.kNone, 0, TypeExtensions.kNone, 0);
+		}
+
+		private static HeaderInfo ReadHeaderInfo(IO.EndianReader s, long headerStart, long streamLength, Shell.ProcessorSize pointerSize)
+		{
+			if (pointerSize == Shell.ProcessorSize.x64)
+			{
+				if (streamLength < headerStart + 36)
+				{
+					return HeaderInfo.Invalid;
+				}
+
+				s.Seek(headerStart + sizeof(uint));
+				int elementCount = s.ReadInt32();
+				s.Seek(headerStart + 12);
+				ulong elementsOffset = s.ReadUInt64();
+				s.Seek(headerStart + 20);
+				int poolSize = s.ReadInt32();
+				s.Seek(headerStart + 28);
+				ulong poolOffset = s.ReadUInt64();
+
+				return new HeaderInfo(elementCount, elementsOffset, poolSize, poolOffset);
+			}
+			else
+			{
+				if (streamLength < headerStart + 16)
+				{
+					return HeaderInfo.Invalid;
+				}
+
+				s.Seek(headerStart);
+				int elementCount = s.ReadInt32();
+				ulong elementsOffset = s.ReadUInt32();
+				int poolSize = s.ReadInt32();
+				ulong poolOffset = s.ReadUInt32();
+
+				return new HeaderInfo(elementCount, elementsOffset, poolSize, poolOffset);
+			}
+		}
+
+		private static bool IsHeaderPlausible(HeaderInfo header, long streamLength, Shell.ProcessorSize pointerSize)
+		{
+			const int x32HeaderSize = 20;
+			const int x64HeaderSize = 40;
+			const int x32ElementSize = 28;
+			const int x64ElementSize = 48;
+
+			if (header.ElementCount < 0 || header.PoolSize < 0)
+			{
+				return false;
+			}
+
+			long minimumHeaderSize = pointerSize == Shell.ProcessorSize.x64
+				? x64HeaderSize
+				: x32HeaderSize;
+			long elementSize = pointerSize == Shell.ProcessorSize.x64
+				? x64ElementSize
+				: x32ElementSize;
+
+			if (streamLength < minimumHeaderSize)
+			{
+				return false;
+			}
+
+			if (header.ElementCount > 0)
+			{
+				if (header.ElementsOffset > long.MaxValue)
+				{
+					return false;
+				}
+
+				long elementsOffset = (long)header.ElementsOffset;
+				long elementsSize = header.ElementCount * elementSize;
+
+				if (elementsSize > streamLength ||
+					elementsOffset < minimumHeaderSize ||
+					elementsOffset > streamLength - elementsSize)
+				{
+					return false;
+				}
+			}
+
+			if (header.PoolSize > 0)
+			{
+				if (header.PoolOffset > long.MaxValue)
+				{
+					return false;
+				}
+
+				long poolOffset = (long)header.PoolOffset;
+
+				if (header.PoolSize > streamLength ||
+					poolOffset < minimumHeaderSize ||
+					poolOffset > streamLength - header.PoolSize)
+				{
+					return false;
+				}
+			}
+
+			return true;
 		}
 
 		public void Write(IO.EndianWriter s)
@@ -201,7 +349,7 @@ namespace KSoft.Phoenix.Xmb
 		{
 			Contract.Ensures(doc == null || Contract.Result<XmlDocument>() != null);
 
-			if (doc != null && mElements != null && mElements.Count > 1)
+			if (doc != null && mElements != null && mElements.Count > 0)
 			{
 				XmbFile.Element root = mElements[0];
 				var root_e = root.ToXml(this, doc, null);
