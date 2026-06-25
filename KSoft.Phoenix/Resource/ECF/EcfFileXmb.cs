@@ -1,5 +1,4 @@
 ﻿#if CONTRACTS_FULL_SHIM
-using System;
 using Contract = System.Diagnostics.ContractsShim.Contract;
 #else
 using Contract = System.Diagnostics.Contracts.Contract; // SHIM'D
@@ -77,10 +76,10 @@ namespace KSoft.Phoenix.Resource.ECF
 
 		private static Phoenix.Xmb.XmbFile ReadXmbFromStream(IO.EndianStream xmbStream, Xmb.XmbFileContext xmbFileContext)
 		{
-			ArgumentNullException.ThrowIfNull(xmbStream);
+			System.ArgumentNullException.ThrowIfNull(xmbStream);
 			if (!xmbStream.CanRead)
 			{
-				throw new ArgumentException("Stream must be readable", nameof(xmbStream));
+				throw new System.ArgumentException("Stream must be readable", nameof(xmbStream));
 			}
 
 			byte[] xmbBytes;
